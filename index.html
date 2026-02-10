@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC Viewer</title>
+    <style>
+        body { font-family: sans-serif; background: #2c2c2c; color: #fff; text-align: center; margin: 0; padding: 20px; }
+        #video-container { margin: 20px auto; max-width: 95%; width: 720px; border: 1px solid #444; border-radius: 8px; overflow: hidden; }
+        video { width: 100%; height: auto; display: block; background: #000; }
+        button { font-size: 16px; padding: 12px 25px; margin-top: 20px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 5px; transition: background-color 0.3s ease; }
+        button:hover:not(:disabled) { background-color: #0056b3; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        #status { margin-top: 15px; font-size: 18px; color: #eee; }
+        .alert { color: yellow; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <h1>WebRTC Viewer</h1>
+    <div id="video-container">
+        <video id="remoteVideo" autoplay playsinline muted></video>
+    </div>
+    <button id="watchButton" disabled>Watch Stream</button>
+    <p id="status">Status: Connecting to Signaling Server...</p>
+
+    <!-- Include Socket.IO client library from a CDN -->
+    <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+
+    <script>
+        // *** สำคัญ: เปลี่ยน URL นี้เป็น URL ของ Signaling Server ที่ Deploy แล้วของคุณ ***
+        const SIGNALING_SERVER_URL = 'ws://localhost:3000'; // สำหรับทดสอบ Local
+        // const SIGNALING_SERVER_URL = 'wss://your-deployed-signaling-server.render.com'; // สำหรับ Production
+
+        const statusText = document.getElementById('status');
+        const watchButton = document.getElementById('watchButton');
+        const videoElement = document.getElementById('remoteVideo');
+
+        let peerConnection;
+        let socket;
+        let isBroadcasterReady = false; // สถานะว่า Broadcaster พร้อมแล้วหรือยัง
+
+        const rtcConfig = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                // ใน Production ควรเพิ่ม TURN servers เพื่อจัดการ Symmetric NATs
+            ]
+        };
+
+        function updateStatus(message, type = '') {
+            statusText.textContent = `Status: ${message}`;
+            statusText.className = type; // ใช้ class สำหรับสี
+        }
+
+        function connectSocket() {
+            socket = io(SIGNALING_SERVER_URL);
+
+            socket.on('connect', () => {
+                updateStatus('Connected to Server. Registering as Viewer.');
+                socket.emit('register-viewer');
+            });
+
+            socket.on('broadcaster-ready', () => {
+                isBroadcasterReady = true;
+                updateStatus('Broadcaster is ready! You can now watch the stream.', 'alert');
+                watchButton.disabled = false;
+            });
+            
+            socket.on('broadcaster-disconnected', () => {
+                isBroadcasterReady = false;
+                updateStatus('Broadcaster has disconnected.', 'error');
+                watchButton.disabled = true;
+                resetPeerConnection();
+            });
+
+            socket.on('offer', async (data) => {
+                // ต้องแน่ใจว่า Broadcaster เป็นคนส่ง Offer นี้จริงๆ (มี BroadcasterID)
+                if (data.broadcasterId && peerConnection) {
+                    console.log('Received SDP Offer from broadcaster.');
+                    updateStatus('Received offer. Setting remote description...');
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                    
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    
+                    // ส่ง Answer กลับไปให้ Broadcaster พร้อมระบุ Viewer ID
+                    socket.emit('answer', { sdp: answer, to: data.broadcasterId });
+                    updateStatus('Sent SDP Answer to broadcaster.');
+                } else {
+                    console.warn('Received an offer without a broadcaster ID or peerConnection not initialized.');
+                }
+            });
+
+            socket.on('ice-candidate', async (data) => {
+                if (peerConnection && data.from === 'broadcaster' && data.candidate) { // ตรวจสอบว่ามาจาก Broadcaster
+                    console.log('Received ICE candidate from broadcaster.');
+                    try {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                        updateStatus('Added ICE candidate.');
+                    } catch (e) {
+                        console.error('Error adding received ICE candidate', e);
+                        updateStatus(`Error adding ICE candidate: ${e.message}`, 'error');
+                    }
+                }
+            });
+
+            socket.on('disconnect', () => {
+                updateStatus('Disconnected from Server.', 'error');
+                watchButton.disabled = true;
+                resetPeerConnection();
+            });
+
+            socket.on('error', (err) => {
+                console.error('Socket error:', err);
+                updateStatus(`Socket error: ${err.message}`, 'error');
+            });
+        }
+        
+        function setupPeerConnection() {
+            resetPeerConnection(); // ให้แน่ใจว่าสถานะสะอาดก่อนเริ่มใหม่
+            peerConnection = new RTCPeerConnection(rtcConfig);
+
+            // เมื่อได้รับ Track (Video/Audio) จาก Peer
+            peerConnection.ontrack = (event) => {
+                console.log('Received remote media stream track.');
+                if (videoElement.srcObject !== event.streams[0]) {
+                    videoElement.srcObject = event.streams[0];
+                    updateStatus('Streaming!', 'success');
+                }
+            };
+            
+            // เมื่อสร้าง ICE Candidate ได้ (สำหรับ Viewer จะส่งกลับไปให้ Broadcaster)
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log('Generated ICE candidate, sending to broadcaster.');
+                    socket.emit('ice-candidate', {
+                        to: 'broadcaster', // ระบุปลายทางเป็น 'broadcaster' (ตามที่ Server รู้จัก)
+                        candidate: event.candidate,
+                        from: socket.id // ระบุตัวเองว่าเป็น Viewer
+                    });
+                }
+            };
+
+            // ตรวจสอบสถานะการเชื่อมต่อ WebRTC
+            peerConnection.onconnectionstatechange = () => {
+                console.log(`WebRTC Connection state change: ${peerConnection.connectionState}`);
+                if (peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'closed') {
+                   updateStatus(`Connection ${peerConnection.connectionState}. Attempting to re-establish...`, 'error');
+                   resetPeerConnection(); // อาจจะต้องลองเชื่อมต่อใหม่ หรือรอ Broadcaster-ready
+                } else if (peerConnection.connectionState === 'connected') {
+                    updateStatus('WebRTC Connection established!', 'success');
+                }
+            };
+
+            // Viewer จะต้องบอกว่าต้องการรับ Video/Audio
+            peerConnection.addTransceiver('video', { direction: 'recvonly' });
+            peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+        }
+
+        async function startWatching() {
+            if (!socket || !socket.connected) {
+                updateStatus('Error: Not connected to the signaling server.', 'error');
+                return;
+            }
+            if (!isBroadcasterReady) {
+                updateStatus('Error: Broadcaster is not ready yet. Please wait.', 'alert');
+                return;
+            }
+
+            console.log('Starting WebRTC connection process as Viewer.');
+            updateStatus('Setting up peer connection and sending offer...');
+            
+            setupPeerConnection(); // สร้าง PeerConnection ใหม่
+            
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            
+            // ส่ง Offer ไปยัง Broadcaster ผ่าน Signaling Server
+            // Server จะรู้ว่า Broadcaster คือใคร
+            socket.emit('offer', { sdp: offer, viewerId: socket.id });
+            updateStatus('SDP Offer sent to broadcaster.');
+        }
+
+        function resetPeerConnection() {
+            if (peerConnection) {
+                console.log('Closing existing peer connection.');
+                peerConnection.close();
+                peerConnection = null;
+            }
+            videoElement.srcObject = null;
+            videoElement.load(); // Force video element to reset
+            updateStatus('Ready to connect.', 'alert'); // สถานะเริ่มต้นหลังรีเซ็ต
+        }
+
+        watchButton.addEventListener('click', startWatching);
+        
+        // Initial setup
+        connectSocket();
+    </script>
+</body>
+</html>
